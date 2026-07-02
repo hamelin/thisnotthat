@@ -10,13 +10,13 @@ import traitlets as tl
 from typing import Any
 import numpy as np
 
-import sys
+import quak
 
 NAME_UNLABELLED = "<Unlabelled>"
 Categorical = Hashable
 Label = str
 Tag = str
-
+SEARCH_HIGHLIGHT_COLOR = "#FFD700"  # gold
 
 def is_value_unlabelled(label: Label) -> bool:
     return str(label).lower() in {
@@ -77,12 +77,17 @@ class TagWidget(AnyWidget):
     tag_to_int = tl.Dict(default_value={}).tag(sync=True)
     int_to_tag = tl.Dict(default_value={}).tag(sync=True)
     selection = tl.List(default_value=[]).tag(sync=True)
+    num_points = tl.Int(default_value=0).tag(sync=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.get_initial_tag_set()
+        if not self.tags:
+            self.tags = [set() for _ in range(self.num_points)]
+
         self._update_tag_mapping()
         self.tags = [self._map_tags_to_int(t) for t in self.tags]
+
         self.observe(self._on_state_change, names=["tag_set"])
         self.on_msg(self._handle_js_message)
 
@@ -142,7 +147,7 @@ class TagWidget(AnyWidget):
         if not (include_buttons_checked or exclude_buttons_checked):
             new_selection = []
 
-        self.selection = new_selection
+        self.selection = list(new_selection)
         self.send_state()
 
     def add_tag_to_selected(self, tag_name, assign=True, auto_include=False):
@@ -183,10 +188,12 @@ class TagWidget(AnyWidget):
                 "include_btn_active": active["include_btn_active"] if active else False,
                 "exclude_btn_active": active["exclude_btn_active"] if active else False
             })
-        self.tag_set = synced_tag_set
+        self.tag_set = list(synced_tag_set)
 
         self.tags = list(self.tags)
         self.calculate_selection()
+        # Ensure immediate front‑end sync
+        self.selection = list(self.selection)
         self.send_state()
 
     def remove_tag_from_selected(self, tag_name, auto_include=False):
@@ -232,6 +239,7 @@ class TagWidget(AnyWidget):
             if tag_id is not None and tag_id in self.int_to_tag:
                 tag = self.int_to_tag[tag_id]
             self.add_tag_to_selected(tag, assign, auto_include)
+            self.send_state()
 
         elif action == "remove_tag_from_selection":
             tag_id = content.get("tag_id")
@@ -249,16 +257,57 @@ class TagEditor(TagWidget):
 
     min_height_item = tl.Int(default_value=24).tag(sync=True)
 
+
+class TopBar(AnyWidget):
+    _esm = Path(__file__).parent / "js" / "topbar.js"
+    _css = Path(__file__).parent / "css" / "topbar.css"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.on_msg(self._handle_js_message)
+        # Will be set by dashboard
+        self._on_search = None
+
+    def _handle_js_message(self, _, content, buffers):
+        action = content.get("action")
+        if action == "search":
+            query = content.get("query", "").strip()
+            if callable(self._on_search):
+                self._on_search(query)
+
+    def clear_search(self):
+        # Reset search widget if scatterplot selection resets
+        self.send({"action": "clear_search"})
+
 class Dashboard:
     def __init__(
         self,
         data: pd.DataFrame,
         labels: str | list[Label] | dict[Hashable, Label] | pd.Series | None,
         tags: str | list[Tag] | dict[Hashable, Tag] | pd.Series = [],
-        height: int = 400
+        height: int = 400,
+        search_columns: list[str] | None = None,
+        hover_column: str | None = None,
+        content_renderer = None
     ) -> None:
         self._data = data
         self._height = height
+        self._content_renderer = content_renderer
+        self._quak_container = wg.Box(layout=wg.Layout(
+                # display="flex",
+                # flex_flow="row wrap",
+                # align_items="stretch",
+                # align_content="stretch",
+                # height=f"{self._height + 25}px",
+                # flex="1 1 auto",
+                width="100%",
+            ))
+        self._quak_container.children = [quak.Widget(self._data.iloc[[]])]
+
+        if search_columns is not None:
+            self._search_columns = search_columns
+        else:
+            self._search_columns = ["text"]
 
         if isinstance(labels, str):
             dict_labels = self._data[labels].to_dict()
@@ -295,8 +344,17 @@ class Dashboard:
             color_map=self._editor.palette,
             height=self._height,
         )
+
+        if hover_column is not None:
+            self._scatter.tooltip(enable=True, properties=hover_column, preview=hover_column)
+
         self._scatter.widget.color = self._editor.palette
-        self._tag_editor = TagEditor(tags=tags)
+        self._tag_editor = TagEditor(tags=tags, num_points=len(self._data))
+
+        # Create the content pane now (empty initially)
+        self._content_pane = wg.Output()
+        with self._content_pane:
+            print("Select points to view details here.")
 
         def on_color_change(_change):
             self._scatter.color(map=self._editor.palette)
@@ -310,6 +368,7 @@ class Dashboard:
         def on_selection_change_tag_editor(change):
             self._scatter.selection(change["new"])
         self._tag_editor.observe(on_selection_change_tag_editor, ["selection"])
+
 
         # Sync scatter selection → both editors, and push to JS immediately
         def on_selection_change_plot(change):
@@ -329,6 +388,20 @@ class Dashboard:
                 self._tag_editor.calculate_selection()
                 self._tag_editor.send_state()
 
+                self._topbar.clear_search()
+
+            # Rebuild quak dataframe widget based on selection
+            # I don't think there is a way to filter programatically
+            # https://github.com/manzt/quak/issues/88
+            if selection_indices:
+                self._quak_container.children = [quak.Widget(self._data.iloc[selection_indices])]
+            else:
+                self._quak_container.children = [quak.Widget(self._data.iloc[[]])]            
+
+            # Render content if there is a callback
+            self._update_content_pane(selection_indices)
+                
+
         self._scatter.widget.observe(on_selection_change_plot, ["selection"])
 
         def on_change_labels(change):
@@ -337,6 +410,53 @@ class Dashboard:
                 how="left"
             )
         self._editor.observe(on_change_labels, "labels")
+
+        # Top search bar handler
+        def handle_search(query: str):
+            if query:
+                mask = pd.Series(False, index=self._data.index)
+                for col in self._search_columns:
+                    if col in self._data.columns:
+                        mask |= self._data[col].astype(str).str.contains(query, case=False, na=False)
+
+                indices = self._data.index[mask].tolist()
+                self._scatter.selection(indices)
+                self._editor.selection = indices
+                self._tag_editor.selection = indices
+                # Force traitlets sync to frontend immediately
+                self._editor.send_state()
+                self._tag_editor.send_state()
+            else:
+                # Empty query clears selection
+                self._scatter.selection([])
+                self._editor.selection = []
+                self._tag_editor.selection = []
+                self._editor.send_state()
+                self._tag_editor.send_state()
+
+            self._editor.send_state()
+            self._tag_editor.send_state()
+
+        self._topbar._on_search = handle_search
+
+
+    def _update_content_pane(self, indices):
+        """Internal method to update right pane when scatter selection changes."""
+        self._content_pane.clear_output()
+
+        with self._content_pane:
+            if not indices:
+                print("No points selected.")
+                return
+            
+            selected_df = self._data.iloc[indices]
+
+            if callable(self._content_renderer):
+                # Let user completely control what is displayed
+                self._content_renderer(indices, selected_df, self._content_pane)
+            else:
+                print(f"You've selected {len(indices)} points")
+                print(f"Selected points: {indices}")
 
     def labels(self, name: str = "labels", colors: str = "") -> pd.Series:
         assert not colors
@@ -349,25 +469,42 @@ class Dashboard:
 
     def show(self) -> wg.Widget:
         self._scatter.height = self._height
-        sw = self._scatter.show([])
+        sw = self._scatter.show()
         sw.height = self._height
         sw.layout.flex = "6 1 auto"
         sw.layout.height = "100%"
-        self._editor.layout.flex = "1 0 auto"
-        self._editor.layout.min_width = "1in"
-        self._editor.layout.max_width = "2.5in"
-        self._editor.layout.margin = "0px 5px 0px 0px"
-        self._editor.layout.height = f"{self._height + 25}px"
+
+        # Common style for left and right panes
+        side_pane_style = dict(
+            flex="1 0 auto",
+            min_width="1in",
+            max_width="2.5in",
+            margin="0px 5px 0px 0px",
+            height=f"{self._height + 25}px",
+            overflow_y="auto"
+        )
+        self._editor.layout = wg.Layout(**side_pane_style)
+        self._tag_editor.layout = wg.Layout(**side_pane_style)
+        self._content_pane.layout = wg.Layout(**side_pane_style)
+
+        # Create a tab widget for both LabelEditor and TagEditor
+        editors_tab = wg.Tab(children=[self._editor, self._tag_editor])
+        editors_tab.set_title(0, "Labels")
+        editors_tab.set_title(1, "Tags")
+        editors_tab.layout = wg.Layout(**side_pane_style)
+
+        # Top search bar
         self._topbar.layout.flex = "0 0 auto"
 
-        self._tag_editor.layout.flex = "1 0 auto"
-        self._tag_editor.layout.min_width = "1in"
-        self._tag_editor.layout.max_width = "2.5in"
-        self._tag_editor.layout.margin = "0px 5px 0px 0px"
-        self._tag_editor.layout.height = f"{self._height + 25}px"
+        # Force it to not overflow if lots of content is selected
+        scrollable_content = wg.Box(
+            [self._content_pane],
+            layout=wg.Layout(**side_pane_style
+            )
+        )
 
         hbox = wg.HBox(
-            children=[self._editor, sw, self._tag_editor],
+            children=[editors_tab, sw, scrollable_content],
             layout=wg.Layout(
                 display="flex",
                 flex_flow="row wrap",
@@ -378,7 +515,17 @@ class Dashboard:
                 width="100%",
             )
         )
-        return hbox
+
+        return wg.VBox(
+            children=[self._topbar, hbox, self._quak_container],
+            layout=wg.Layout(
+                display="flex",
+                flex_flow="column wrap",
+                align_content="center",
+                width="100%"
+            )
+        )
+
 
 __all__ = [
     "CategoricalEditor",

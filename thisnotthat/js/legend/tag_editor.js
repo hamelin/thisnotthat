@@ -92,7 +92,20 @@ function updateTagState(tag_id, newState) {
         });
     }
 
-    addTagBtn.addEventListener("click", () => addTagToSelection(newTagInput.value));
+    addTagBtn.addEventListener("click", () => {
+        addTagToSelection(newTagInput.value);
+        // Force immediate fetch from model and refresh UI highlight
+        setTimeout(() => {
+            const selection = model.get("selection");
+            if (selection && selection.length) {
+                // Force scatter selection highlight
+                model.set("selection", [...selection]);
+                model.save_changes();
+            }
+        }, 50);
+    });
+
+  
     newTagInput.addEventListener("keypress", e => {
       if (e.key === "Enter") addTagToSelection(newTagInput.value);
     });
